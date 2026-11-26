@@ -48,6 +48,12 @@ export function createWeb({ host, mapId, store, getState, applyState, navigate }
   let panelOpen = innerWidth > 900;
   let focusPath = [];
   let deletedByMe = null;
+  // Recherche
+  let query = '';
+  let matchIds = []; // ids des elements trouves (dans toute la carte), tries par pertinence
+  let matchKeys = new Set(); // resultats visibles dans la toile actuelle
+  let searchKeys = null; // resultats visibles + branches qui en contiennent (null = pas de recherche)
+  let flashKey = null;
 
   const cam = { yaw: 0.35, pitch: 0.95, dist: 900, autoDist: 900, zoom: 1, tx: 0, ty: 0, tz: 0 };
 
@@ -75,10 +81,129 @@ export function createWeb({ host, mapId, store, getState, applyState, navigate }
     h('span', h('i.lg-link'), 'Lien entre branches'),
     h('span', h('i.lg-member'), 'Membre')
   );
-  const hint = h('div.web-hint', 'Glisser pour tourner · Molette pour zoomer · Survoler une étoile pour voir sa branche · Clic pour plonger dedans');
+  const hint = h('div.web-hint', 'Glisser pour tourner · Molette pour zoomer · Survoler une étoile pour voir sa branche · Clic pour plonger dedans · / pour rechercher');
   const addBtn = h('button.web-add', { onclick: () => addNode(), 'aria-label': 'Ajouter un élément', title: 'Ajouter un élément (N)' }, icon('plus', 22));
-  const el = h('section.web', { hidden: true }, canvas, h('div.web-top', crumbs, counter), legend, hint, empty, addBtn, panelToggle, panel, tip);
+  // Barre de recherche
+  const searchInput = h('input.web-search-input', { type: 'search', placeholder: 'Rechercher…', 'aria-label': 'Rechercher dans la toile', spellcheck: false, autocomplete: 'off' });
+  const searchCount = h('span.web-search-count');
+  const searchClear = h('button.web-search-clear', { type: 'button', 'aria-label': 'Effacer la recherche', onclick: () => { setQuery(''); searchInput.focus(); } }, icon('x', 14));
+  const searchResults = h('div.web-search-results', { role: 'listbox' });
+  const search = h(
+    'div.web-search',
+    h('div.web-search-box', h('span.web-search-icon', icon('search', 15)), searchInput, searchCount, searchClear),
+    searchResults
+  );
+  const el = h('section.web', { hidden: true }, canvas, h('div.web-top', crumbs, search, counter), legend, hint, empty, addBtn, panelToggle, panel, tip);
   host.append(el);
+
+  const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+
+  function setQuery(q) {
+    query = q;
+    if (searchInput.value !== q) searchInput.value = q;
+    computeMatches();
+    computeSearchView();
+    renderSearch();
+  }
+
+  // Cherche dans toute la carte : titre d'abord, puis description
+  function computeMatches() {
+    const q = norm(query.trim());
+    if (!q) return (matchIds = []);
+    const scored = [];
+    // dans les descriptions : seulement en debut de mot (evite "iso" dans "isolés")
+    const wordStart = new RegExp('(^|[^a-z0-9])' + q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    for (const n of S().nodes) {
+      const t = norm(n.title);
+      const score = t === q ? 0 : t.startsWith(q) ? 1 : t.includes(q) ? 2 : q.length >= 2 && wordStart.test(norm(n.description)) ? 3 : -1;
+      if (score >= 0) scored.push({ id: n.id, score, level: levelOf(n.id) });
+    }
+    scored.sort((a, b) => a.score - b.score || a.level - b.level);
+    matchIds = scored.map((x) => x.id);
+  }
+
+  // Ce qui reste net dans la toile actuelle : les resultats visibles, et les
+  // etoiles visibles qui contiennent un resultat plus profond
+  function computeSearchView() {
+    matchKeys = new Set();
+    if (!query.trim()) return (searchKeys = null);
+    searchKeys = new Set();
+    if (graph.nodes[0]) searchKeys.add(graph.nodes[0].key);
+    for (const id of matchIds) {
+      if (graph.byKey.has('n' + id)) {
+        matchKeys.add('n' + id);
+        searchKeys.add('n' + id);
+      }
+      for (const a of ancestors(id)) if (graph.byKey.has('n' + a.id)) searchKeys.add('n' + a.id);
+    }
+  }
+
+  function renderSearch() {
+    const has = !!query.trim();
+    search.classList.toggle('active', has);
+    searchCount.textContent = has ? String(matchIds.length) : '';
+    if (!has) return mount(searchResults);
+    const q = norm(query.trim());
+    const highlight = (title) => {
+      const i = norm(title).indexOf(q);
+      return i < 0 ? title : [title.slice(0, i), h('mark', title.slice(i, i + q.length)), title.slice(i + q.length)];
+    };
+    mount(
+      searchResults,
+      matchIds.length
+        ? [
+            h('div.wsr-head', `${plural(matchIds.length, 'résultat')}`, matchKeys.size < matchIds.length ? ` · ${matchKeys.size} visible${matchKeys.size > 1 ? 's' : ''} ici` : ''),
+            matchIds.slice(0, 8).map((id, i) => {
+              const n = nodeById(id);
+              const k = KINDS[n.kind] || KINDS.besoin;
+              const path = ancestors(id).slice(0, -1);
+              return h(
+                'button.wsr-item',
+                {
+                  type: 'button',
+                  class: i === 0 ? 'first' : '',
+                  onmousedown: (e) => e.preventDefault(), // garde le focus dans le champ
+                  onclick: () => goToResult(id),
+                  onmouseenter: () => (panelHoverKey = graph.byKey.has('n' + id) ? 'n' + id : null),
+                  onmouseleave: () => (panelHoverKey = null),
+                },
+                h('i.kdot', { class: 'k-' + n.kind, style: { '--c': k.color } }),
+                h('span.wsr-main', h('span.wsr-title', highlight(n.title)), h('small', path.length ? path.map((p) => truncate(p.title, 22)).join(' › ') : 'Niveau 1')),
+                h('small.wsr-level', `niv. ${path.length + 1}`)
+              );
+            }),
+            matchIds.length > 8 && h('div.wsr-more', `+ ${matchIds.length - 8} autres : précise ta recherche`),
+          ]
+        : h('div.wsr-empty', 'Aucun élément ne correspond')
+    );
+  }
+
+  // Aller a un resultat : on se place sur la roue de son parent, il est mis en evidence
+  function goToResult(id) {
+    const n = nodeById(id);
+    if (!n) return;
+    searchInput.blur();
+    search.classList.remove('open');
+    flashKey = 'n' + id;
+    setTimeout(() => flashKey === 'n' + id && (flashKey = null), 2600);
+    const target = n.parent_id ? `/carte/${mapId}/besoins/${n.parent_id}` : `/carte/${mapId}/besoins`;
+    if (location.pathname !== target) navigate(target);
+  }
+
+  searchInput.addEventListener('input', () => setQuery(searchInput.value));
+  searchInput.addEventListener('focus', () => search.classList.add('open'));
+  searchInput.addEventListener('blur', () => setTimeout(() => search.classList.remove('open'), 120));
+  searchInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && matchIds.length) {
+      e.preventDefault();
+      goToResult(matchIds[0]);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      if (query) setQuery('');
+      else searchInput.blur();
+    }
+  });
 
   const stars = Array.from({ length: 420 }, () => {
     const u = Math.random() * 2 - 1;
@@ -158,11 +283,13 @@ export function createWeb({ host, mapId, store, getState, applyState, navigate }
     const focusLevel = levelOf(focus);
     const g = { nodes: [], edges: [], rings: [], byKey: new Map(), focusLevel };
 
-    // 1. Arbre visible sous le centre (limite a MAX_DEPTH roues)
+    // 1. Arbre visible sous le centre. Vue globale (projet) : uniquement le niveau 1,
+    //    pour une roue epuree ; on plonge dans un besoin pour voir ses niveaux.
+    const depthLimit = focus == null ? 1 : MAX_DEPTH;
     const tree = (n, depth) => ({
       n,
       depth,
-      children: depth < MAX_DEPTH ? (kids.get(n ? n.id : 0) || []).map((c) => tree(c, depth + 1)) : [],
+      children: depth < depthLimit ? (kids.get(n ? n.id : 0) || []).map((c) => tree(c, depth + 1)) : [],
     });
     const root = tree(focus != null ? nodeById(focus) : null, 0);
     // poids d'une branche : 1 pour l'element + une part de ses enfants (equilibre les secteurs)
@@ -180,10 +307,14 @@ export function createWeb({ host, mapId, store, getState, applyState, navigate }
     };
     spans(root, Math.PI * 2);
 
-    // 3. Rayon de chaque roue : au moins 62 px d'arc entre deux etoiles voisines
+    // 3. Rayon de chaque roue : un arc minimal entre deux etoiles voisines
+    //    (plus large en vue globale : on profite de toute la place)
+    const gap = focus == null ? 84 : 70;
     const radius = [0];
     for (let l = 1; l < perLevel.length; l++) {
-      radius[l] = clamp(Math.max(radius[l - 1] + (l === 1 ? 230 : 160), 62 / (minSpan[l] || 1)), 0, radius[l - 1] + 1100);
+      // ecart entre roues : plus serre quand une roue ne porte que peu d'elements
+      const step = l === 1 ? 240 : clamp(70 + perLevel[l] * 10, 110, 170);
+      radius[l] = clamp(Math.max(radius[l - 1] + step, gap / (minSpan[l] || 1)), 0, radius[l - 1] + 1100);
     }
 
     // 4. Secteurs : chaque branche recoit sa part de roue
@@ -205,7 +336,7 @@ export function createWeb({ host, mapId, store, getState, applyState, navigate }
         r: depth === 0 ? 24 : Math.max(5.5, k.r * (1.2 - depth * 0.12)),
         inside: pr.total,
         insideDone: pr.done,
-        hiddenBelow: depth === MAX_DEPTH && pr.total > 0,
+        hiddenBelow: depth === depthLimit && pr.total > 0,
       };
     };
     const place = (key, data, gx, gy, gz, from) => {
@@ -223,6 +354,7 @@ export function createWeb({ host, mapId, store, getState, applyState, navigate }
       center = place('root', { type: 'root', depth: 0, level: 0, title: s.map.name, r: 28, color: '#c4b5fd', core: '#ffffff', inside: total, insideDone: done }, 0, 0, 0);
     } else center = place('n' + focus, props(root.n, 0), 0, 0, 0);
 
+    const ringIndex = [];
     const assign = (t, a0, a1, parentNode) => {
       let a = a0;
       const total = t.children.reduce((s2, c) => s2 + c.w, 0);
@@ -230,7 +362,15 @@ export function createWeb({ host, mapId, store, getState, applyState, navigate }
         const span = ((a1 - a0) * c.w) / total;
         const ang = a + span / 2;
         const R = radius[c.depth];
-        const node = place('n' + c.n.id, { ...props(c.n, c.depth), angle: ang }, Math.cos(ang) * R, c.depth * LEVEL_DROP, Math.sin(ang) * R, parentNode.key);
+        ringIndex[c.depth] = (ringIndex[c.depth] ?? -1) + 1;
+        const node = place(
+          'n' + c.n.id,
+          { ...props(c.n, c.depth), angle: ang, ringIndex: ringIndex[c.depth] },
+          Math.cos(ang) * R,
+          c.depth * LEVEL_DROP,
+          Math.sin(ang) * R,
+          parentNode.key
+        );
         g.edges.push({ a: parentNode, b: node, type: 'tree' });
         assign(c, a, a + span, node);
         a += span;
@@ -241,37 +381,64 @@ export function createWeb({ host, mapId, store, getState, applyState, navigate }
     const maxDepth = perLevel.length - 1;
     for (let l = 1; l <= maxDepth; l++) g.rings.push({ depth: l, level: focusLevel + l, R: radius[l], y: l * LEVEL_DROP });
 
-    // 4. Liens transverses : arcs entre etoiles visibles, ou vers la roue "Ailleurs"
-    const outerR = (radius[maxDepth] || 0) + 190;
-    const outerY = (maxDepth + 1) * LEVEL_DROP;
-    let ghosts = 0;
+    // 5. Liens transverses : arcs entre etoiles visibles. Dans un besoin, les
+    //    elements d'autres branches relies vont sur la roue exterieure "Ailleurs".
+    //    (Vue globale : seulement les liens entre besoins de niveau 1.)
+    const pending = []; // { other, anchors: [noeud visible] }
     for (const l of s.links) {
-      let A = g.byKey.get('n' + l.source_id);
-      let B = g.byKey.get('n' + l.target_id);
-      if (!A && !B) continue;
-      if (!A || !B) {
-        const known = A || B;
+      const A = g.byKey.get('n' + l.source_id);
+      const B = g.byKey.get('n' + l.target_id);
+      if (A && B) g.edges.push({ a: A, b: B, type: 'link' });
+      else if ((A || B) && focus != null) {
         const other = nodeById(A ? l.target_id : l.source_id);
         if (!other) continue;
-        let gh = g.byKey.get('n' + other.id);
-        if (!gh) {
-          const ang = (known.angle ?? 0) + (ghosts++ % 3) * 0.09;
-          const path = ancestors(other.id);
-          gh = place(
-            'n' + other.id,
-            { ...props(other, maxDepth + 1), ghost: true, level: path.length, where: path.length > 1 ? path[0].title : null, r: 7 },
-            Math.cos(ang) * outerR,
-            outerY,
-            Math.sin(ang) * outerR,
-            known.key
-          );
-        }
-        if (A) B = gh;
-        else A = gh;
+        let p = pending.find((x) => x.other.id === other.id);
+        if (!p) pending.push((p = { other, anchors: [] }));
+        p.anchors.push(A || B);
       }
-      g.edges.push({ a: A, b: B, type: 'link' });
     }
-    if (g.nodes.some((n) => n.ghost)) g.rings.push({ depth: maxDepth + 1, level: null, R: outerR, y: outerY, outer: true });
+    if (pending.length) {
+      // Angle souhaite : celui de l'etoile reliee (le centre n'a pas d'angle : on repartit)
+      pending.forEach((p, i) => {
+        const anchored = p.anchors.filter((a) => a.angle != null);
+        p.want = anchored.length ? anchored.reduce((s2, a) => s2 + a.angle, 0) / anchored.length : -Math.PI / 2 + (i / pending.length) * Math.PI * 2;
+      });
+      pending.sort((a, b) => a.want - b.want);
+      const outerR = Math.max((radius[maxDepth] || 0) + 150, (pending.length * 90) / (2 * Math.PI), 260);
+      const outerY = (maxDepth + 1) * LEVEL_DROP;
+      // On ecarte les voisins trop proches, en restant pres de leur angle souhaite
+      const minGap = Math.min((2 * Math.PI) / pending.length, 90 / outerR);
+      const ang = pending.map((p) => p.want);
+      for (let pass = 0; pass < 40; pass++) {
+        let moved = false;
+        for (let i = 0; i < ang.length; i++) {
+          const j = (i + 1) % ang.length;
+          if (ang.length < 2) break;
+          let d = ang[j] - ang[i];
+          if (j === 0) d += Math.PI * 2;
+          if (d < minGap) {
+            const push = (minGap - d) / 2 + 1e-4;
+            ang[i] -= push;
+            ang[j] += push;
+            moved = true;
+          }
+        }
+        if (!moved) break;
+      }
+      pending.forEach((p, i) => {
+        const path = ancestors(p.other.id);
+        const gh = place(
+          'n' + p.other.id,
+          { ...props(p.other, maxDepth + 1), ghost: true, angle: ang[i], ringIndex: i, level: path.length, where: path.length > 1 ? path[0].title : null, r: 7.5 },
+          Math.cos(ang[i]) * outerR,
+          outerY,
+          Math.sin(ang[i]) * outerR,
+          p.anchors[0].key
+        );
+        for (const a of p.anchors) g.edges.push({ a, b: gh, type: 'link' });
+      });
+      g.rings.push({ depth: maxDepth + 1, level: null, R: outerR, y: outerY, outer: true });
+    }
 
     // 5. Membres : petite couronne au-dessus du centre, reliee a ce dont ils s'occupent
     const involved = new Set(g.nodes.filter((n) => n.type === 'node' && n.assignee).map((n) => n.assignee));
@@ -283,6 +450,11 @@ export function createWeb({ host, mapId, store, getState, applyState, navigate }
     });
 
     graph = g;
+    if (query.trim()) {
+      computeMatches(); // les donnees ont pu changer (ajout, renommage, temps reel)
+      computeSearchView();
+      renderSearch();
+    }
   }
 
   // Branche d'une etoile : ses ancetres, ses descendants et ce qui y est relie
@@ -316,10 +488,11 @@ export function createWeb({ host, mapId, store, getState, applyState, navigate }
   // ------------------------------ Camera -----------------------------------
   let W = 0, H = 0, F = 800, dpr = 1;
   function resize() {
-    const r = el.getBoundingClientRect();
+    // clientWidth/Height = taille reelle, sans l'agrandissement de l'animation
+    // d'ouverture (getBoundingClientRect l'incluait : clics decales de ~4 %)
     dpr = Math.min(2, devicePixelRatio || 1);
-    W = r.width;
-    H = r.height;
+    W = canvas.clientWidth || el.clientWidth;
+    H = canvas.clientHeight || el.clientHeight;
     canvas.width = Math.round(W * dpr);
     canvas.height = Math.round(H * dpr);
     F = Math.min(W, H) * 1.15;
@@ -341,11 +514,14 @@ export function createWeb({ host, mapId, store, getState, applyState, navigate }
   }
 
   // Distance pour que toutes les roues + leurs etiquettes tiennent a l'ecran
+  // Vue globale plus en plongee (roue bien ronde), un peu plus de relief dans un besoin
+  const viewPitch = () => (focus == null ? 1.12 : 0.95);
+
   function fitDistance() {
     let R = 160;
     for (const r of graph.rings) R = Math.max(R, r.R + 30);
     const availW = panelOpen && W > 900 ? W - 360 : W;
-    const halfW = Math.max(120, availW / 2 - Math.min(170, availW * 0.18)); // place pour les etiquettes
+    const halfW = Math.max(110, availW / 2 - clamp(availW * 0.26, 80, 190)); // place pour les etiquettes
     const halfH = Math.max(120, H / 2 - 70);
     const byW = (R * F) / halfW;
     const byH = (R * Math.sin(cam.pitch) * F) / halfH + R * Math.cos(cam.pitch) * 0.6;
@@ -383,8 +559,12 @@ export function createWeb({ host, mapId, store, getState, applyState, navigate }
     const fog = (p) => (p ? clamp(1.35 - (p.depth - cam.dist * 0.6) / (cam.dist * 1.2), 0.14, 1) : 0);
     const active = hoverKey || panelHoverKey;
     const activeNode = active && graph.byKey.get(active);
-    const branch = activeNode ? branchOf(activeNode) : null;
+    // Recherche : les resultats (et les branches qui les contiennent) restent nets,
+    // tout le reste passe en transparence. Le survol reste prioritaire.
+    const searching = !activeNode && searchKeys;
+    const branch = activeNode ? branchOf(activeNode) : searching ? searchKeys : null;
     const inBranch = (n) => !branch || branch.has(n.key);
+    const isMatch = (n) => searching && matchKeys.has(n.key);
 
     // Roues (une par niveau) + leur numero
     for (const ring of graph.rings) {
@@ -475,7 +655,7 @@ export function createWeb({ host, mapId, store, getState, applyState, navigate }
       const p = n.p;
       const isActive = n === activeNode;
       const dim = branch && !inBranch(n);
-      const al = fog(p) * fade * (dim ? 0.22 : 1) * (n.ghost ? 0.7 : 1);
+      const al = fog(p) * fade * (dim ? (searching ? 0.12 : 0.22) : 1) * (n.ghost ? 0.7 : 1);
       const r = n.r * p.s;
       const col = n.done ? DONE : n.ghost ? '#94a3b8' : n.color;
 
@@ -556,6 +736,30 @@ export function createWeb({ host, mapId, store, getState, applyState, navigate }
         ctx.arc(p.x, p.y, r + 5, 0, Math.PI * 2);
         ctx.stroke();
       }
+      if (isMatch(n)) {
+        // resultat de recherche : double anneau dore qui pulse
+        const k = 0.5 + 0.5 * Math.sin(t * 0.006);
+        const flash = n.key === flashKey ? 1.6 : 1;
+        ctx.strokeStyle = rgba('#fde68a', 0.95);
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, r + 5, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.strokeStyle = rgba('#fde68a', 0.5 * (1 - k));
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, r + 8 + k * 12 * flash, 0, Math.PI * 2);
+        ctx.stroke();
+      } else if (searching && n.type === 'node' && searchKeys.has(n.key) && n.depth > 0) {
+        // contient un resultat plus profond : anneau pointille
+        ctx.setLineDash([3, 4]);
+        ctx.strokeStyle = rgba('#fde68a', 0.7);
+        ctx.lineWidth = 1.3;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, r + 6, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
       ctx.globalAlpha = 1;
 
       n.al = al;
@@ -563,7 +767,7 @@ export function createWeb({ host, mapId, store, getState, applyState, navigate }
 
     // Etiquettes : les plus importantes d'abord, une etiquette qui en chevauche
     // une autre est masquee (elle reapparait au survol de sa branche)
-    const prio = (n) => (n === activeNode ? -3 : branch && branch.has(n.key) ? -2 : n.depth === 0 ? -1 : 0);
+    const prio = (n) => (n === activeNode ? -3 : isMatch(n) ? -2.5 : branch && branch.has(n.key) ? -2 : n.depth === 0 ? -1 : 0);
     const queue = order
       .filter((n) => n.al > 0.06)
       .sort((a, b) => prio(a) - prio(b) || a.depth - b.depth || a.p.depth - b.p.depth);
@@ -575,25 +779,34 @@ export function createWeb({ host, mapId, store, getState, applyState, navigate }
       const forced = prio(n) < 0;
       const size = (n.depth === 0 ? 17 : n.type === 'member' ? 12 : n.depth === 1 ? 13.5 : n.depth === 2 ? 12 : 11) * clamp(p.s, 0.8, 1.3);
       const weight = n.depth <= 1 || n.type === 'member' ? 650 : 550;
-      const txt = (n.ghost && n.where ? `↗ ${truncate(n.where, 18)} › ` : '') + truncate(n.title, n.depth === 0 ? 40 : 32);
+      const txt = (n.ghost ? '↗ ' : '') + truncate(n.title, n.depth === 0 ? 40 : n.ghost ? 28 : 32);
       ctx.font = `${weight} ${size}px ${FONT}`;
       const w = ctx.measureText(txt).width;
-      let x, y, align;
-      if (n.depth === 0) {
-        align = 'center';
-        x = p.x;
-        y = p.y + r * 1.45 + size + 6;
-      } else {
-        const right = !centerP || p.x >= centerP.x;
-        align = right ? 'left' : 'right';
-        x = right ? p.x + r + 7 : p.x - r - 7;
-        y = p.y + size * 0.36;
+      // Positions candidates, dans l'ordre de preference ; on garde la premiere libre
+      const cands = [];
+      const side = (right) => ({ align: right ? 'left' : 'right', x: right ? p.x + r + 7 : p.x - r - 7, y: p.y + size * 0.36 });
+      const vert = (up, step) => ({ align: 'center', x: p.x, y: up ? p.y - r - 6 - step * size * 1.25 : p.y + r + size + 4 + step * size * 1.25 });
+      if (n.depth === 0) cands.push({ align: 'center', x: p.x, y: p.y + r * 1.45 + size + 6 });
+      else {
+        const dx = centerP ? p.x - centerP.x : 1;
+        const dy = centerP ? p.y - centerP.y : 0;
+        const right = dx >= 0;
+        if (Math.abs(dy) > Math.abs(dx) * 0.9) {
+          // haut / bas de la roue : etiquette centree vers l'exterieur, en quinconce
+          const up = dy < 0;
+          const stagger = (n.ringIndex ?? 0) % 2;
+          cands.push(vert(up, stagger), vert(up, 1 - stagger), vert(up, 2), side(right));
+        } else cands.push(side(right), vert(dy < 0, 0), vert(dy >= 0, 0));
       }
-      const box = { x: align === 'center' ? x - w / 2 : align === 'left' ? x : x - w, y: y - size, w, h: size * 1.3 };
-      if (!forced && overlaps(box)) continue;
-      boxes.push(box);
+      const boxOf = (c) => ({ x: c.align === 'center' ? c.x - w / 2 : c.align === 'left' ? c.x : c.x - w, y: c.y - size, w, h: size * 1.3 });
+      let pick = cands.find((c) => !overlaps(boxOf(c)));
+      if (!pick) {
+        if (!forced) continue;
+        pick = cands[0];
+      }
+      boxes.push(boxOf(pick));
       const color = n.type === 'member' ? n.color : n.kind === 'contrainte' && !n.ghost ? '#fca5a5' : n.done ? '#a7f3d0' : n.ghost ? '#94a3b8' : n.depth <= 1 ? '#ffffff' : '#cbd5e1';
-      label(txt, x, y, size, weight, color, n.al, align);
+      label(txt, pick.x, pick.y, size, weight, color, n.al, pick.align);
     }
   }
 
@@ -610,7 +823,7 @@ export function createWeb({ host, mapId, store, getState, applyState, navigate }
       n.z += (n.gz - n.z) * k;
       posCache.set(n.key, { x: n.x, y: n.y, z: n.z });
     }
-    if (!drag && !hoverKey && !panelHoverKey && !busy && t - lastInteract > 2500 && !prefersReducedMotion()) cam.yaw += 0.0001 * dt;
+    if (!drag && !hoverKey && !panelHoverKey && !busy && !searchKeys && t - lastInteract > 2500 && !prefersReducedMotion()) cam.yaw += 0.0001 * dt;
     if (!busy) {
       cam.autoDist += (fitDistance() - cam.autoDist) * (1 - Math.exp(-dt / 350));
       cam.dist = cam.autoDist * cam.zoom;
@@ -660,7 +873,7 @@ export function createWeb({ host, mapId, store, getState, applyState, navigate }
     let best = null, bestD = Infinity;
     for (const n of graph.nodes) {
       if (!n.p) continue;
-      const r = Math.max(n.r * n.p.s, 7) + 5;
+      const r = Math.max(n.r * n.p.s, 9) + 7; // zone de clic un peu plus large que le point
       const d = Math.hypot(n.p.x - x, n.p.y - y);
       if (d < r && n.p.depth < bestD) { best = n; bestD = n.p.depth; }
     }
@@ -749,6 +962,7 @@ export function createWeb({ host, mapId, store, getState, applyState, navigate }
       tip,
       h('small', { class: 'k-' + (n.kind || n.type) }, kind, n.type === 'node' ? ` · niveau ${n.level}` : '', n.done ? ' · ✓ validé' : ''),
       h('b', n.title),
+      n.ghost && n.where && h('span', 'Branche : ', n.where),
       n.type === 'node' && h('span', 'Dépend de : ', parent ? parent.title : S().map.name),
       n.type === 'node' && n.inside > 0 && h('span', `${n.insideDone}/${n.inside} en place juste en dessous`),
       links > 0 && h('span', `Relié à ${plural(links, 'autre élément')}`),
@@ -763,7 +977,11 @@ export function createWeb({ host, mapId, store, getState, applyState, navigate }
 
   const onKey = (e) => {
     if (!visible || hasOpenModal() || e.target.closest?.('input, textarea, select')) return;
-    if (e.key === 'Escape' && focus != null) {
+    if (e.key === '/') {
+      e.preventDefault();
+      searchInput.focus();
+      searchInput.select();
+    } else if (e.key === 'Escape' && focus != null) {
       e.preventDefault();
       goUp();
     } else if (e.key === 'n' || e.key === 'N') {
@@ -802,6 +1020,7 @@ export function createWeb({ host, mapId, store, getState, applyState, navigate }
     buildGraph();
     snap();
     cam.tx = cam.ty = cam.tz = 0;
+    cam.pitch = viewPitch();
     cam.autoDist = fitDistance();
     renderChrome();
     const d0 = goingIn ? cam.autoDist * 0.35 : cam.autoDist * 2.2;
@@ -1192,6 +1411,7 @@ export function createWeb({ host, mapId, store, getState, applyState, navigate }
       buildGraph();
       snap();
       cam.zoom = 1;
+      cam.pitch = viewPitch();
       cam.tx = cam.ty = cam.tz = 0;
       cam.autoDist = fitDistance();
       cam.dist = cam.autoDist;
