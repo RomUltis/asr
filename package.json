@@ -1,0 +1,17 @@
+{
+  "name": "orbit",
+  "version": "1.0.0",
+  "description": "Orbit — cartes mentales collaboratives pour répartir les tâches d'un projet de groupe",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "optionalDependencies": {
+    "mysql2": "^3.11.0"
+  }
+}

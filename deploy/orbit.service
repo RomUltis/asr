@@ -1,0 +1,23 @@
+# ===========================================================================
+#  Orbit — service systemd (demarrage automatique + redemarrage en cas de crash)
+#  1. Adaptez User et WorkingDirectory
+#  2. sudo cp deploy/orbit.service /etc/systemd/system/
+#  3. sudo systemctl daemon-reload && sudo systemctl enable --now orbit
+#  Logs : journalctl -u orbit -f
+# ===========================================================================
+
+[Unit]
+Description=Orbit - cartes mentales collaboratives
+After=network.target mysql.service mariadb.service
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/var/www/orbit
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=3
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
